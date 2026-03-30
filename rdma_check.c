@@ -15,6 +15,7 @@
 
 #define MAGIC 0x52444d41u
 #define READY 0x79
+#define DONE 0x64
 #define STR_BYTES 64
 
 typedef enum { MODE_SERVER, MODE_CLIENT } run_mode_t;
@@ -36,9 +37,12 @@ typedef struct {
     uint32_t magic;
     uint16_t lid;
     uint8_t mtu;
-    uint8_t reserved;
+    uint8_t reserved0;
     uint32_t qpn;
     uint32_t psn;
+    uint64_t addr;
+    uint32_t rkey;
+    uint32_t region_bytes;
 } peer_info_t;
 
 typedef struct {
@@ -51,9 +55,9 @@ typedef struct {
     uint32_t magic;
     uint32_t status;
     uint64_t messages;
+    uint64_t checked_slots;
     uint64_t bad_seq;
     uint64_t bad_payload;
-    uint64_t elapsed_ns;
 } summary_t;
 
 typedef struct {
@@ -61,10 +65,8 @@ typedef struct {
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     struct ibv_qp *qp;
-    struct ibv_mr *send_mr;
-    struct ibv_mr *recv_mr;
-    uint8_t *send_buf;
-    uint8_t *recv_buf;
+    struct ibv_mr *mr;
+    uint8_t *buf;
     size_t slot_size;
     uint32_t depth;
     peer_info_t local;
@@ -238,9 +240,11 @@ static int parse_config(const char *path, config_t *cfg) {
 static void *xmem(size_t bytes) {
     void *ptr = NULL;
     size_t page = (size_t)(sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096);
+    int rc;
 
-    if (posix_memalign(&ptr, page, bytes) != 0) {
-        perror("posix_memalign");
+    rc = posix_memalign(&ptr, page, bytes);
+    if (rc != 0) {
+        fprintf(stderr, "posix_memalign: %s\n", strerror(rc));
         exit(1);
     }
     memset(ptr, 0, bytes);
@@ -393,6 +397,7 @@ static struct ibv_context *open_device(const char *name) {
         }
     }
     ibv_free_device_list(list);
+
     if (verbs == NULL) {
         fprintf(stderr, "IB device '%s' not found\n", name);
     }
@@ -406,7 +411,7 @@ static int qp_init(struct ibv_qp *qp, uint8_t port) {
     attr.qp_state = IBV_QPS_INIT;
     attr.port_num = port;
     attr.pkey_index = 0;
-    attr.qp_access_flags = 0;
+    attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
     return ibv_modify_qp(qp, &attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
 }
@@ -423,6 +428,7 @@ static int qp_rtr(struct ibv_qp *qp, uint8_t port, const peer_info_t *peer) {
     attr.min_rnr_timer = 12;
     attr.ah_attr.dlid = peer->lid;
     attr.ah_attr.sl = 0;
+    attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.port_num = port;
     return ibv_modify_qp(qp, &attr,
         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
@@ -448,6 +454,7 @@ static int rdma_open(const config_t *cfg, rdma_t *rdma) {
     struct ibv_port_attr port_attr;
     struct ibv_qp_init_attr qp_attr;
     size_t bytes;
+    int mr_access;
 
     memset(rdma, 0, sizeof(*rdma));
     rdma->slot_size = cfg->message_size;
@@ -467,7 +474,7 @@ static int rdma_open(const config_t *cfg, rdma_t *rdma) {
         perror("ibv_alloc_pd");
         return -1;
     }
-    rdma->cq = ibv_create_cq(rdma->verbs, (int)(cfg->queue_depth * 2 + 8), NULL, NULL, 0);
+    rdma->cq = ibv_create_cq(rdma->verbs, (int)(cfg->queue_depth + 8), NULL, NULL, 0);
     if (rdma->cq == NULL) {
         perror("ibv_create_cq");
         return -1;
@@ -478,7 +485,7 @@ static int rdma_open(const config_t *cfg, rdma_t *rdma) {
     qp_attr.recv_cq = rdma->cq;
     qp_attr.qp_type = IBV_QPT_RC;
     qp_attr.cap.max_send_wr = cfg->queue_depth + 1;
-    qp_attr.cap.max_recv_wr = cfg->queue_depth + 1;
+    qp_attr.cap.max_recv_wr = 1;
     qp_attr.cap.max_send_sge = 1;
     qp_attr.cap.max_recv_sge = 1;
     rdma->qp = ibv_create_qp(rdma->pd, &qp_attr);
@@ -492,12 +499,18 @@ static int rdma_open(const config_t *cfg, rdma_t *rdma) {
     }
 
     bytes = rdma->slot_size * rdma->depth;
-    rdma->send_buf = xmem(bytes);
-    rdma->recv_buf = xmem(bytes);
-    rdma->send_mr = ibv_reg_mr(rdma->pd, rdma->send_buf, bytes, 0);
-    rdma->recv_mr = ibv_reg_mr(rdma->pd, rdma->recv_buf, bytes, IBV_ACCESS_LOCAL_WRITE);
-    if (rdma->send_mr == NULL || rdma->recv_mr == NULL) {
-        perror(rdma->send_mr == NULL ? "ibv_reg_mr send" : "ibv_reg_mr recv");
+    if (bytes > UINT32_MAX) {
+        fprintf(stderr, "region too large\n");
+        return -1;
+    }
+    rdma->buf = xmem(bytes);
+    mr_access = IBV_ACCESS_LOCAL_WRITE;
+    if (cfg->mode == MODE_SERVER) {
+        mr_access |= IBV_ACCESS_REMOTE_WRITE;
+    }
+    rdma->mr = ibv_reg_mr(rdma->pd, rdma->buf, bytes, mr_access);
+    if (rdma->mr == NULL) {
+        perror("ibv_reg_mr");
         return -1;
     }
 
@@ -507,6 +520,9 @@ static int rdma_open(const config_t *cfg, rdma_t *rdma) {
     rdma->local.mtu = (uint8_t)port_attr.active_mtu;
     rdma->local.qpn = rdma->qp->qp_num;
     rdma->local.psn = (uint32_t)(rand() & 0x00ffffffu);
+    rdma->local.addr = (uint64_t)(uintptr_t)rdma->buf;
+    rdma->local.rkey = rdma->mr->rkey;
+    rdma->local.region_bytes = (uint32_t)bytes;
     return 0;
 }
 
@@ -514,11 +530,8 @@ static void rdma_close(rdma_t *rdma) {
     if (rdma->qp != NULL) {
         ibv_destroy_qp(rdma->qp);
     }
-    if (rdma->send_mr != NULL) {
-        ibv_dereg_mr(rdma->send_mr);
-    }
-    if (rdma->recv_mr != NULL) {
-        ibv_dereg_mr(rdma->recv_mr);
+    if (rdma->mr != NULL) {
+        ibv_dereg_mr(rdma->mr);
     }
     if (rdma->cq != NULL) {
         ibv_destroy_cq(rdma->cq);
@@ -529,8 +542,7 @@ static void rdma_close(rdma_t *rdma) {
     if (rdma->verbs != NULL) {
         ibv_close_device(rdma->verbs);
     }
-    free(rdma->send_buf);
-    free(rdma->recv_buf);
+    free(rdma->buf);
 }
 
 static int exchange_peer(int fd, const peer_info_t *local, peer_info_t *remote) {
@@ -545,24 +557,8 @@ static int exchange_peer(int fd, const peer_info_t *local, peer_info_t *remote) 
     return 0;
 }
 
-static int post_recv(const rdma_t *rdma, uint32_t slot) {
-    struct ibv_sge sge;
-    struct ibv_recv_wr wr;
-    struct ibv_recv_wr *bad = NULL;
-
-    memset(&sge, 0, sizeof(sge));
-    memset(&wr, 0, sizeof(wr));
-    sge.addr = (uintptr_t)(rdma->recv_buf + (size_t)slot * rdma->slot_size);
-    sge.length = (uint32_t)rdma->slot_size;
-    sge.lkey = rdma->recv_mr->lkey;
-    wr.wr_id = slot;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    return ibv_post_recv(rdma->qp, &wr, &bad);
-}
-
-static void fill_send(const rdma_t *rdma, uint32_t slot, uint64_t seq) {
-    uint8_t *base = rdma->send_buf + (size_t)slot * rdma->slot_size;
+static void fill_slot(const rdma_t *rdma, uint32_t slot, uint64_t seq) {
+    uint8_t *base = rdma->buf + (size_t)slot * rdma->slot_size;
     msg_header_t *h = (msg_header_t *)base;
     size_t i;
 
@@ -574,44 +570,67 @@ static void fill_send(const rdma_t *rdma, uint32_t slot, uint64_t seq) {
     }
 }
 
-static int post_send(const rdma_t *rdma, uint32_t slot) {
+static int post_write(const rdma_t *rdma, uint32_t slot, const peer_info_t *remote) {
     struct ibv_sge sge;
     struct ibv_send_wr wr;
     struct ibv_send_wr *bad = NULL;
+    uint64_t remote_addr;
 
     memset(&sge, 0, sizeof(sge));
     memset(&wr, 0, sizeof(wr));
-    sge.addr = (uintptr_t)(rdma->send_buf + (size_t)slot * rdma->slot_size);
+    remote_addr = remote->addr + (uint64_t)slot * (uint64_t)rdma->slot_size;
+
+    sge.addr = (uintptr_t)(rdma->buf + (size_t)slot * rdma->slot_size);
     sge.length = (uint32_t)rdma->slot_size;
-    sge.lkey = rdma->send_mr->lkey;
+    sge.lkey = rdma->mr->lkey;
+
     wr.wr_id = slot;
     wr.sg_list = &sge;
     wr.num_sge = 1;
-    wr.opcode = IBV_WR_SEND;
+    wr.opcode = IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = remote->rkey;
+
     return ibv_post_send(rdma->qp, &wr, &bad);
 }
 
-static int poll_wc(struct ibv_cq *cq, struct ibv_wc *wc) {
+static int poll_wc(struct ibv_cq *cq) {
+    struct ibv_wc wc;
     int rc;
 
     do {
-        rc = ibv_poll_cq(cq, 1, wc);
+        rc = ibv_poll_cq(cq, 1, &wc);
     } while (rc == 0);
     if (rc < 0) {
         perror("ibv_poll_cq");
         return -1;
     }
-    if (wc->status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "CQ error: %s opcode=%d\n", ibv_wc_status_str(wc->status), wc->opcode);
+    if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "CQ error: %s opcode=%d\n", ibv_wc_status_str(wc.status), wc.opcode);
         return -1;
     }
-    return 0;
+    return wc.opcode == IBV_WC_RDMA_WRITE ? 0 : -1;
 }
 
-static void validate_recv(const rdma_t *rdma, uint32_t slot, uint64_t seq,
+static int expected_seq_for_slot(uint64_t iterations, uint32_t depth, uint32_t slot, uint64_t *seq) {
+    if (iterations == 0 || slot >= depth) {
+        return 0;
+    }
+    if (iterations <= depth) {
+        if (slot >= iterations) {
+            return 0;
+        }
+        *seq = slot;
+        return 1;
+    }
+    *seq = (iterations - 1) - ((iterations - 1 - slot) % depth);
+    return 1;
+}
+
+static void validate_slot(const rdma_t *rdma, uint32_t slot, uint64_t seq,
     uint64_t *bad_seq, uint64_t *bad_payload) {
-    uint8_t *base = rdma->recv_buf + (size_t)slot * rdma->slot_size;
+    uint8_t *base = rdma->buf + (size_t)slot * rdma->slot_size;
     msg_header_t *h = (msg_header_t *)base;
     size_t i;
 
@@ -628,92 +647,73 @@ static void validate_recv(const rdma_t *rdma, uint32_t slot, uint64_t seq,
 }
 
 static int run_server(const config_t *cfg, const rdma_t *rdma, int fd) {
-    uint64_t posted = 0;
-    uint64_t received = 0;
+    uint8_t byte = READY;
+    summary_t summary;
+    uint64_t checked = 0;
     uint64_t bad_seq = 0;
     uint64_t bad_payload = 0;
-    uint64_t start_ns;
-    summary_t summary;
-    uint8_t ready = READY;
-    uint32_t warm = cfg->queue_depth;
+    uint32_t slot;
 
-    if ((uint64_t)warm > cfg->iterations) {
-        warm = (uint32_t)cfg->iterations;
-    }
-    while (posted < warm) {
-        if (post_recv(rdma, (uint32_t)posted) != 0) {
-            perror("ibv_post_recv");
-            return -1;
-        }
-        posted++;
-    }
-    if (write_full(fd, &ready, sizeof(ready)) != 0) {
+    if (write_full(fd, &byte, sizeof(byte)) != 0) {
         perror("write ready");
         return -1;
     }
+    if (read_full(fd, &byte, sizeof(byte)) != 0) {
+        perror("read done");
+        return -1;
+    }
+    if (byte != DONE) {
+        fprintf(stderr, "done byte mismatch\n");
+        return -1;
+    }
 
-    start_ns = now_ns();
-    while (received < cfg->iterations) {
-        struct ibv_wc wc;
-        uint32_t slot;
+    for (slot = 0; slot < cfg->queue_depth; slot++) {
+        uint64_t seq;
 
-        if (poll_wc(rdma->cq, &wc) != 0) {
-            return -1;
+        if (!expected_seq_for_slot(cfg->iterations, cfg->queue_depth, slot, &seq)) {
+            continue;
         }
-        if (wc.opcode != IBV_WC_RECV) {
-            fprintf(stderr, "unexpected opcode %d on server\n", wc.opcode);
-            return -1;
-        }
-
-        slot = (uint32_t)wc.wr_id;
-        validate_recv(rdma, slot, received, &bad_seq, &bad_payload);
-        received++;
-        if (posted < cfg->iterations) {
-            if (post_recv(rdma, slot) != 0) {
-                perror("ibv_post_recv refill");
-                return -1;
-            }
-            posted++;
-        }
+        validate_slot(rdma, slot, seq, &bad_seq, &bad_payload);
+        checked++;
     }
 
     memset(&summary, 0, sizeof(summary));
     summary.magic = MAGIC;
-    summary.messages = received;
+    summary.status = (bad_seq == 0 && bad_payload == 0) ? 0u : 1u;
+    summary.messages = cfg->iterations;
+    summary.checked_slots = checked;
     summary.bad_seq = bad_seq;
     summary.bad_payload = bad_payload;
-    summary.elapsed_ns = now_ns() - start_ns;
-    summary.status = (bad_seq == 0 && bad_payload == 0) ? 0u : 1u;
-
     if (write_full(fd, &summary, sizeof(summary)) != 0) {
         perror("write summary");
         return -1;
     }
-    printf("server workload=%s messages=%" PRIu64 " bytes=%zu elapsed_ms=%.3f bad_seq=%" PRIu64 " bad_payload=%" PRIu64 "\n",
+
+    printf("server workload=%s messages=%" PRIu64 " checked_slots=%" PRIu64 " slot_bytes=%zu bad_seq=%" PRIu64 " bad_payload=%" PRIu64 "\n",
         cfg->workload == WORKLOAD_CHECK ? "check" : "bench",
-        received,
+        cfg->iterations,
+        checked,
         cfg->message_size,
-        (double)summary.elapsed_ns / 1000000.0,
         bad_seq,
         bad_payload);
     return summary.status == 0 ? 0 : -1;
 }
 
-static int run_client(const config_t *cfg, const rdma_t *rdma, int fd) {
-    uint8_t ready;
+static int run_client(const config_t *cfg, const rdma_t *rdma, const peer_info_t *remote, int fd) {
+    uint8_t byte;
+    summary_t summary;
     uint64_t posted = 0;
     uint64_t done = 0;
     uint32_t inflight = 0;
     uint64_t start_ns;
     uint64_t elapsed_ns;
-    summary_t summary;
 
-    if (read_full(fd, &ready, sizeof(ready)) != 0) {
+    if (read_full(fd, &byte, sizeof(byte)) != 0) {
         perror("read ready");
         return -1;
     }
-    if (ready != READY) {
-        fprintf(stderr, "remote ready mismatch\n");
+    if (byte != READY) {
+        fprintf(stderr, "ready byte mismatch\n");
         return -1;
     }
 
@@ -721,8 +721,9 @@ static int run_client(const config_t *cfg, const rdma_t *rdma, int fd) {
     while (done < cfg->iterations) {
         while (posted < cfg->iterations && inflight < cfg->queue_depth) {
             uint32_t slot = (uint32_t)(posted % cfg->queue_depth);
-            fill_send(rdma, slot, posted);
-            if (post_send(rdma, slot) != 0) {
+
+            fill_slot(rdma, slot, posted);
+            if (post_write(rdma, slot, remote) != 0) {
                 perror("ibv_post_send");
                 return -1;
             }
@@ -730,13 +731,7 @@ static int run_client(const config_t *cfg, const rdma_t *rdma, int fd) {
             inflight++;
         }
         if (inflight > 0) {
-            struct ibv_wc wc;
-
-            if (poll_wc(rdma->cq, &wc) != 0) {
-                return -1;
-            }
-            if (wc.opcode != IBV_WC_SEND) {
-                fprintf(stderr, "unexpected opcode %d on client\n", wc.opcode);
+            if (poll_wc(rdma->cq) != 0) {
                 return -1;
             }
             done++;
@@ -745,6 +740,11 @@ static int run_client(const config_t *cfg, const rdma_t *rdma, int fd) {
     }
     elapsed_ns = now_ns() - start_ns;
 
+    byte = DONE;
+    if (write_full(fd, &byte, sizeof(byte)) != 0) {
+        perror("write done");
+        return -1;
+    }
     if (read_full(fd, &summary, sizeof(summary)) != 0) {
         perror("read summary");
         return -1;
@@ -754,7 +754,7 @@ static int run_client(const config_t *cfg, const rdma_t *rdma, int fd) {
         return -1;
     }
 
-    printf("client workload=%s messages=%" PRIu64 " bytes=%zu elapsed_ms=%.3f msg_per_sec=%.2f MiB_per_sec=%.2f remote_status=%u remote_bad_seq=%" PRIu64 " remote_bad_payload=%" PRIu64 "\n",
+    printf("client workload=%s messages=%" PRIu64 " slot_bytes=%zu elapsed_ms=%.3f msg_per_sec=%.2f MiB_per_sec=%.2f remote_status=%u checked_slots=%" PRIu64 " remote_bad_seq=%" PRIu64 " remote_bad_payload=%" PRIu64 "\n",
         cfg->workload == WORKLOAD_CHECK ? "check" : "bench",
         cfg->iterations,
         cfg->message_size,
@@ -762,6 +762,7 @@ static int run_client(const config_t *cfg, const rdma_t *rdma, int fd) {
         (double)cfg->iterations * 1000000000.0 / (double)elapsed_ns,
         ((double)cfg->iterations * (double)cfg->message_size * 1000000000.0) / ((double)elapsed_ns * 1024.0 * 1024.0),
         summary.status,
+        summary.checked_slots,
         summary.bad_seq,
         summary.bad_payload);
     return summary.status == 0 ? 0 : -1;
@@ -808,6 +809,10 @@ int main(int argc, char **argv) {
     if (exchange_peer(fd, &rdma.local, &remote) != 0) {
         goto out;
     }
+    if (remote.region_bytes < rdma.slot_size * rdma.depth) {
+        fprintf(stderr, "remote region too small\n");
+        goto out;
+    }
     if (remote.mtu > rdma.local.mtu) {
         remote.mtu = rdma.local.mtu;
     }
@@ -816,17 +821,20 @@ int main(int argc, char **argv) {
         goto out;
     }
 
-    printf("connected mode=%s control=%s:%u local_lid=%u remote_lid=%u local_qpn=%u remote_qpn=%u\n",
+    printf("connected mode=%s control=%s:%u local_lid=%u remote_lid=%u local_qpn=%u remote_qpn=%u remote_addr=0x%llx remote_rkey=0x%x region_bytes=%u\n",
         mode_name(cfg.mode),
         cfg.control_host,
         cfg.control_port,
         (unsigned int)rdma.local.lid,
         (unsigned int)remote.lid,
         rdma.local.qpn,
-        remote.qpn);
+        remote.qpn,
+        (unsigned long long)remote.addr,
+        remote.rkey,
+        remote.region_bytes);
     fflush(stdout);
 
-    rc = cfg.mode == MODE_SERVER ? run_server(&cfg, &rdma, fd) : run_client(&cfg, &rdma, fd);
+    rc = cfg.mode == MODE_SERVER ? run_server(&cfg, &rdma, fd) : run_client(&cfg, &rdma, &remote, fd);
 
 out:
     if (fd >= 0) {
