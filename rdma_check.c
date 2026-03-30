@@ -83,6 +83,10 @@ typedef struct {
     peer_info_t local;
 } rdma_ctx_t;
 
+static const char *mode_name(run_mode_t mode) {
+    return mode == MODE_SERVER ? "server" : "client";
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr, "usage: %s <config>\n", argv0);
 }
@@ -959,6 +963,16 @@ int main(int argc, char **argv) {
         perror("ibv_modify_qp RTS");
         goto out;
     }
+
+    printf("connected mode=%s control=%s:%u local_lid=%u remote_lid=%u local_qpn=%u remote_qpn=%u\n",
+        mode_name(cfg.mode),
+        cfg.control_host,
+        cfg.control_port,
+        (unsigned int)ctx.local.lid,
+        (unsigned int)remote.lid,
+        ctx.local.qpn,
+        remote.qpn);
+    fflush(stdout);
 
     if (cfg.mode == MODE_SERVER) {
         rc = server_loop(&cfg, &ctx, control_fd) == 0 ? 0 : 1;
