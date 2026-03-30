@@ -393,9 +393,15 @@ static int open_server_socket(const config_t *cfg) {
         return -1;
     }
 
+    printf("bootstrap mode=server listening on %s:%u\n", cfg->control_host, cfg->control_port);
+    fflush(stdout);
+
     conn_fd = accept(listen_fd, NULL, NULL);
     if (conn_fd < 0) {
         perror("accept");
+    } else {
+        printf("bootstrap mode=server accepted client\n");
+        fflush(stdout);
     }
     close(listen_fd);
     return conn_fd;
@@ -420,12 +426,17 @@ static int open_client_socket(const config_t *cfg) {
         return -1;
     }
 
+    printf("bootstrap mode=client connecting to %s:%u\n", cfg->control_host, cfg->control_port);
+    fflush(stdout);
+
     for (it = result; it != NULL; it = it->ai_next) {
         fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if (fd < 0) {
             continue;
         }
         if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+            printf("bootstrap mode=client connected to %s:%u\n", cfg->control_host, cfg->control_port);
+            fflush(stdout);
             break;
         }
         close(fd);
@@ -931,6 +942,19 @@ int main(int argc, char **argv) {
     if (parse_config(argv[1], &cfg) != 0) {
         return 1;
     }
+
+    printf("startup mode=%s workload=%s control=%s:%u ib_device=%s ib_port=%u gid_index=%d message_size=%zu iterations=%" PRIu64 " queue_depth=%u\n",
+        mode_name(cfg.mode),
+        cfg.workload == WORKLOAD_CHECK ? "check" : "bench",
+        cfg.control_host,
+        cfg.control_port,
+        cfg.ib_device,
+        (unsigned int)cfg.ib_port,
+        cfg.gid_index,
+        cfg.message_size,
+        cfg.iterations,
+        cfg.queue_depth);
+    fflush(stdout);
 
     srand((unsigned int)(time(NULL) ^ (time_t)getpid()));
 
