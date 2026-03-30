@@ -42,7 +42,7 @@ typedef struct {
     uint32_t psn;
     uint64_t addr;
     uint32_t rkey;
-    uint32_t region_bytes;
+    uint64_t region_bytes;
 } peer_info_t;
 
 typedef struct {
@@ -499,10 +499,6 @@ static int rdma_open(const config_t *cfg, rdma_t *rdma) {
     }
 
     bytes = rdma->slot_size * rdma->depth;
-    if (bytes > UINT32_MAX) {
-        fprintf(stderr, "region too large\n");
-        return -1;
-    }
     rdma->buf = xmem(bytes);
     mr_access = IBV_ACCESS_LOCAL_WRITE;
     if (cfg->mode == MODE_SERVER) {
@@ -522,7 +518,7 @@ static int rdma_open(const config_t *cfg, rdma_t *rdma) {
     rdma->local.psn = (uint32_t)(rand() & 0x00ffffffu);
     rdma->local.addr = (uint64_t)(uintptr_t)rdma->buf;
     rdma->local.rkey = rdma->mr->rkey;
-    rdma->local.region_bytes = (uint32_t)bytes;
+    rdma->local.region_bytes = (uint64_t)bytes;
     return 0;
 }
 
@@ -821,7 +817,7 @@ int main(int argc, char **argv) {
         goto out;
     }
 
-    printf("connected mode=%s control=%s:%u local_lid=%u remote_lid=%u local_qpn=%u remote_qpn=%u remote_addr=0x%llx remote_rkey=0x%x region_bytes=%u\n",
+    printf("connected mode=%s control=%s:%u local_lid=%u remote_lid=%u local_qpn=%u remote_qpn=%u remote_addr=0x%llx remote_rkey=0x%x region_bytes=%llu\n",
         mode_name(cfg.mode),
         cfg.control_host,
         cfg.control_port,
@@ -831,7 +827,7 @@ int main(int argc, char **argv) {
         remote.qpn,
         (unsigned long long)remote.addr,
         remote.rkey,
-        remote.region_bytes);
+        (unsigned long long)remote.region_bytes);
     fflush(stdout);
 
     rc = cfg.mode == MODE_SERVER ? run_server(&cfg, &rdma, fd) : run_client(&cfg, &rdma, &remote, fd);
