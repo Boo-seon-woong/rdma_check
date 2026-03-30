@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -607,7 +609,7 @@ static int setup_rdma(const config_t *cfg, rdma_ctx_t *ctx) {
     ctx->local.mtu = (uint8_t)port_attr.active_mtu;
     ctx->local.gid_index = cfg->gid_index < 0 ? UINT8_MAX : (uint8_t)cfg->gid_index;
     ctx->local.qpn = ctx->qp->qp_num;
-    ctx->local.psn = (uint32_t)(lrand48() & 0x00ffffffu);
+    ctx->local.psn = (uint32_t)(((unsigned int)rand()) & 0x00ffffffu);
 
     if (cfg->gid_index >= 0) {
         union ibv_gid gid;
@@ -926,7 +928,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    srand48((long)(time(NULL) ^ getpid()));
+    srand((unsigned int)(time(NULL) ^ (time_t)getpid()));
 
     if (setup_rdma(&cfg, &ctx) != 0) {
         cleanup_rdma(&ctx);
