@@ -406,7 +406,9 @@ static int qp_init(struct ibv_qp *qp, uint8_t port) {
     attr.qp_state = IBV_QPS_INIT;
     attr.port_num = port;
     attr.pkey_index = 0;
-    return ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT);
+    attr.qp_access_flags = 0;
+    return ibv_modify_qp(qp, &attr,
+        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
 }
 
 static int qp_rtr(struct ibv_qp *qp, uint8_t port, const peer_info_t *peer) {
